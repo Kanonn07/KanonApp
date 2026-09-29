@@ -3,78 +3,126 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>音声日記カレンダー</title>
+    <title>ほぼ日記</title>
     <style>
       button[aria-pressed="true"] {
         outline: 2px solid currentColor;
         font-weight: bold;
       }
+
+      #history-entry {
+        white-space: pre-wrap;
+      }
     </style>
   </head>
   <body>
     <main>
-      <h1>音声日記カレンダー</h1>
-      <p>日付を選び、経験したことや思ったことを録音してください。音声はブラウザ内で文字起こしし、日記はこのブラウザに保存されます。</p>
+      <h1>ほぼ日記</h1>
+      <p>日々の出来事や思ったことを記録します。音声とタイトルはブラウザ内のAIで処理し、日記はこのブラウザに保存します。</p>
+      <p>初回はAIモデルのダウンロードにネット接続が必要です。タイトル作成モデルは約480MBです。</p>
 
-      <p>
-        <button id="previous-month" type="button">前の月</button>
-        <strong id="month-label" aria-live="polite"></strong>
-        <button id="next-month" type="button">次の月</button>
-      </p>
+      <section id="calendar-screen" aria-labelledby="calendar-heading">
+        <h2 id="calendar-heading">カレンダー</h2>
+        <p>
+          <button id="previous-month" type="button">前の月</button>
+          <strong id="month-label" aria-live="polite"></strong>
+          <button id="next-month" type="button">次の月</button>
+        </p>
 
-      <table>
-        <thead>
-          <tr>
-            <th scope="col">日</th>
-            <th scope="col">月</th>
-            <th scope="col">火</th>
-            <th scope="col">水</th>
-            <th scope="col">木</th>
-            <th scope="col">金</th>
-            <th scope="col">土</th>
-          </tr>
-        </thead>
-        <tbody id="calendar-days"></tbody>
-      </table>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">日</th>
+              <th scope="col">月</th>
+              <th scope="col">火</th>
+              <th scope="col">水</th>
+              <th scope="col">木</th>
+              <th scope="col">金</th>
+              <th scope="col">土</th>
+            </tr>
+          </thead>
+          <tbody id="calendar-days"></tbody>
+        </table>
 
-      <section aria-labelledby="selected-date">
-        <h2 id="selected-date"></h2>
-        <label for="diary-entry">この日の日記</label>
-        <p><textarea id="diary-entry" rows="8" cols="50"></textarea></p>
-        <p id="save-status" role="status" aria-live="polite"></p>
+        <form id="search-form">
+          <p>
+            <label for="search-keyword">日記をキーワードで検索</label>
+            <input id="search-keyword" type="search" />
+            <button type="submit">検索</button>
+          </p>
+        </form>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ul id="search-results"></ul>
       </section>
 
-      <section aria-labelledby="voice-heading">
-        <h2 id="voice-heading">音声入力</h2>
-        <p>録音は最大30秒です。初回は文字起こしモデルのダウンロードにネット接続が必要です。</p>
-        <button id="start-recording" type="button">録音開始</button>
-        <button id="stop-recording" type="button" disabled>録音停止</button>
-        <span id="recording-time" aria-live="polite"></span>
-        <p id="speech-status" role="status" aria-live="polite">録音を開始すると、この日の記録に文字起こしを追記します。</p>
+      <section id="diary-screen" aria-labelledby="date-heading" hidden>
+        <p><button id="back-to-calendar" type="button">カレンダーへ戻る</button></p>
+        <h2 id="date-heading"></h2>
+
+        <p>
+          <label for="diary-title">日記のタイトル</label>
+          <input id="diary-title" type="text" maxlength="80" />
+          <button id="generate-title" type="button">AIでタイトルを作成</button>
+        </p>
+        <p id="title-status" role="status" aria-live="polite"></p>
+
+        <section id="today-view" aria-labelledby="today-heading" hidden>
+          <h3 id="today-heading">今日の日記</h3>
+          <label for="diary-entry">日記</label>
+          <p><textarea id="diary-entry" rows="8" cols="50"></textarea></p>
+          <p id="save-status" role="status" aria-live="polite"></p>
+
+          <h3>音声入力</h3>
+          <p>録音は最大30秒です。初回は文字起こしモデルのダウンロードにネット接続が必要です。</p>
+          <button id="start-recording" type="button">録音開始</button>
+          <button id="stop-recording" type="button" disabled>録音停止</button>
+          <span id="recording-time" aria-live="polite"></span>
+          <p id="speech-status" role="status" aria-live="polite">録音した内容は今日の日記に追記されます。</p>
+        </section>
+
+        <section id="history-view" aria-labelledby="history-heading" hidden>
+          <h3 id="history-heading">日記の履歴</h3>
+          <p id="history-entry"></p>
+          <p id="history-empty" hidden>この日の日記はまだありません。</p>
+        </section>
       </section>
     </main>
 
     <script type="module">
       import { env, pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+      import { loadDiaryEntries, saveDiaryEntries } from "./diary-data.js";
 
       env.allowLocalModels = false;
 
       const MODEL_ID = "onnx-community/whisper-tiny";
-      const STORAGE_KEY = "kanon-voice-diary-v1";
       const TARGET_SAMPLE_RATE = 16000;
       const MAX_RECORDING_SECONDS = 30;
 
+      const calendarScreen = document.querySelector("#calendar-screen");
+      const diaryScreen = document.querySelector("#diary-screen");
       const previousMonthButton = document.querySelector("#previous-month");
       const nextMonthButton = document.querySelector("#next-month");
       const monthLabel = document.querySelector("#month-label");
       const calendarDays = document.querySelector("#calendar-days");
-      const selectedDateHeading = document.querySelector("#selected-date");
+      const searchForm = document.querySelector("#search-form");
+      const searchKeyword = document.querySelector("#search-keyword");
+      const searchStatus = document.querySelector("#search-status");
+      const searchResults = document.querySelector("#search-results");
+      const backButton = document.querySelector("#back-to-calendar");
+      const dateHeading = document.querySelector("#date-heading");
+      const diaryTitle = document.querySelector("#diary-title");
+      const generateTitleButton = document.querySelector("#generate-title");
+      const titleStatus = document.querySelector("#title-status");
+      const todayView = document.querySelector("#today-view");
       const diaryEntry = document.querySelector("#diary-entry");
       const saveStatus = document.querySelector("#save-status");
       const startRecordingButton = document.querySelector("#start-recording");
       const stopRecordingButton = document.querySelector("#stop-recording");
       const recordingTime = document.querySelector("#recording-time");
       const speechStatus = document.querySelector("#speech-status");
+      const historyView = document.querySelector("#history-view");
+      const historyEntry = document.querySelector("#history-entry");
+      const historyEmpty = document.querySelector("#history-empty");
 
       const monthFormatter = new Intl.DateTimeFormat("ja-JP", {
         year: "numeric",
@@ -87,11 +135,20 @@
         weekday: "long",
       });
 
-      const today = new Date();
-      let currentMonth = new Date(today.getFullYear(), today.getMonth(), 1);
-      let selectedDate = toDateKey(today);
       let storageAvailable = true;
-      let entries = loadEntries();
+      let entries = {};
+      try {
+        entries = loadDiaryEntries();
+      } catch (error) {
+        console.error(error);
+        storageAvailable = false;
+        saveStatus.textContent = `日記を読み込めませんでした: ${error instanceof Error ? error.message : String(error)}`;
+      }
+
+      const today = new Date();
+      const todayKey = toDateKey(today);
+      let currentMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+      let activeDate = null;
       let transcriber = null;
       let transcriberPromise = null;
       let recordingState = "idle";
@@ -102,6 +159,7 @@
       let recordingStartedAt = 0;
       let recordingInterval = null;
       let recordingTimeout = null;
+      let titleNavigationPending = false;
       let leavingPage = false;
 
       function toDateKey(date) {
@@ -116,43 +174,31 @@
         return new Date(year, month - 1, day);
       }
 
-      function loadEntries() {
-        try {
-          const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
-          if (!saved || Array.isArray(saved) || typeof saved !== "object") {
-            throw new Error("保存データの形式が正しくありません。");
-          }
-          return saved;
-        } catch (error) {
-          console.error(error);
-          storageAvailable = false;
-          saveStatus.textContent = `日記を読み込めませんでした: ${error instanceof Error ? error.message : String(error)}`;
-          return {};
-        }
+      function getEntry(dateKey) {
+        return entries[dateKey] ?? { text: "", title: "", titleEdited: false };
       }
 
-      function setEntry(dateKey, text) {
-        if (!storageAvailable) {
-          saveStatus.textContent = "ブラウザの保存領域を利用できないため、日記を保存できません。";
-          return;
-        }
+      function updateEntry(dateKey, changes) {
+        if (!storageAvailable) return false;
 
+        const updatedEntry = { ...getEntry(dateKey), ...changes };
         const nextEntries = { ...entries };
-        if (text.trim()) {
-          nextEntries[dateKey] = text;
+        if (updatedEntry.text.trim()) {
+          nextEntries[dateKey] = updatedEntry;
         } else {
           delete nextEntries[dateKey];
         }
 
         try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(nextEntries));
+          saveDiaryEntries(nextEntries);
           entries = nextEntries;
-          saveStatus.textContent = text.trim() ? "このブラウザに保存しました。" : "日記を削除しました。";
           renderCalendar();
+          if (!calendarScreen.hidden && searchKeyword.value.trim()) searchDiary();
+          return true;
         } catch (error) {
           console.error(error);
           storageAvailable = false;
-          saveStatus.textContent = `日記を保存できませんでした: ${error instanceof Error ? error.message : String(error)}`;
+          return false;
         }
       }
 
@@ -176,17 +222,18 @@
               cell.setAttribute("aria-hidden", "true");
             } else {
               const dateKey = toDateKey(new Date(year, month, day));
+              const entry = getEntry(dateKey);
+              const hasEntry = Boolean(entry.text.trim());
               const button = document.createElement("button");
-              const hasEntry = typeof entries[dateKey] === "string" && entries[dateKey].trim();
               button.type = "button";
-              button.disabled = recordingState !== "idle";
-              button.setAttribute("aria-pressed", String(dateKey === selectedDate));
+              button.disabled = dateKey > todayKey || recordingState !== "idle" || titleNavigationPending;
+              button.setAttribute("aria-pressed", String(dateKey === activeDate));
               button.setAttribute(
                 "aria-label",
-                `${dateFormatter.format(dateFromKey(dateKey))}${hasEntry ? "、日記あり" : ""}`,
+                `${dateFormatter.format(dateFromKey(dateKey))}${hasEntry ? `、${entry.title || "日記あり"}` : ""}`,
               );
               button.textContent = hasEntry ? `${day} •` : String(day);
-              button.addEventListener("click", () => selectDate(dateKey));
+              button.addEventListener("click", () => openDiary(dateKey));
               cell.append(button);
             }
 
@@ -197,39 +244,131 @@
         }
 
         calendarDays.replaceChildren(...rows);
-        previousMonthButton.disabled = recordingState !== "idle";
-        nextMonthButton.disabled = recordingState !== "idle";
+        const latestMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+        previousMonthButton.disabled = recordingState !== "idle" || titleNavigationPending;
+        nextMonthButton.disabled =
+          recordingState !== "idle" ||
+          titleNavigationPending ||
+          currentMonth.getTime() >= latestMonth.getTime();
       }
 
-      function selectDate(dateKey) {
-        selectedDate = dateKey;
-        const date = dateFromKey(dateKey);
-        currentMonth = new Date(date.getFullYear(), date.getMonth(), 1);
-        selectedDateHeading.textContent = dateFormatter.format(date);
-        diaryEntry.value = typeof entries[dateKey] === "string" ? entries[dateKey] : "";
-        saveStatus.textContent = storageAvailable
-          ? diaryEntry.value.trim()
-            ? "このブラウザに保存されています。"
-            : "日記はまだありません。入力内容は自動保存されます。"
-          : "ブラウザの保存領域を利用できません。";
+      function updateDayControls() {
+        const entry = getEntry(activeDate);
+        const locked = recordingState !== "idle" || titleNavigationPending;
+        const hasText = Boolean(entry.text.trim());
+        diaryTitle.value = entry.title;
+        generateTitleButton.textContent = entry.title ? "AIでタイトルをつけ直す" : "AIでタイトルを作成";
+        diaryTitle.disabled = !storageAvailable || !hasText || locked;
+        generateTitleButton.disabled = !storageAvailable || !hasText || locked;
+        diaryEntry.disabled = !storageAvailable || locked;
+        startRecordingButton.disabled = !storageAvailable || locked;
+        stopRecordingButton.disabled = recordingState !== "recording";
+        backButton.disabled = locked;
+      }
+
+      function openDiary(dateKey, { skipAutomaticTitle = false } = {}) {
+        if (dateKey > todayKey) return;
+
+        activeDate = dateKey;
+        const isToday = dateKey === todayKey;
+        const entry = getEntry(dateKey);
+        calendarScreen.hidden = true;
+        diaryScreen.hidden = false;
+        todayView.hidden = !isToday;
+        historyView.hidden = isToday;
+        dateHeading.textContent = dateFormatter.format(dateFromKey(dateKey));
+        diaryTitle.value = entry.title;
+        titleStatus.textContent = entry.title
+          ? entry.titleEdited
+            ? "タイトルを編集できます。"
+            : "AIが日記の内容からつけたタイトルです。必要なら編集できます。"
+          : entry.text.trim()
+            ? "日記の内容からタイトルを作成できます。"
+            : "日記を記録するとタイトルをつけられます。";
+
+        if (isToday) {
+          diaryEntry.value = entry.text;
+          saveStatus.textContent = !storageAvailable
+            ? "ブラウザの保存領域を利用できないため、日記を保存できません。"
+            : entry.text.trim()
+              ? "今日の日記をこのブラウザに保存しています。"
+              : "音声入力すると今日の日記に追記されます。";
+          speechStatus.textContent = storageAvailable
+            ? "録音した内容は今日の日記に追記されます。"
+            : "ブラウザの保存領域を利用できないため、録音できません。";
+        } else {
+          historyEntry.textContent = entry.text;
+          historyEntry.hidden = !entry.text.trim();
+          historyEmpty.hidden = Boolean(entry.text.trim());
+        }
+
+        updateDayControls();
         renderCalendar();
+
+        if (
+          !skipAutomaticTitle &&
+          entry.text.trim() &&
+          !entry.title.trim() &&
+          !entry.titleEdited
+        ) {
+          void openTitleGenerator(dateKey, isToday ? "today" : "history");
+        }
+      }
+
+      function returnToCalendar() {
+        activeDate = null;
+        diaryScreen.hidden = true;
+        calendarScreen.hidden = false;
+        recordingTime.textContent = "";
+        renderCalendar();
+        if (searchKeyword.value.trim()) searchDiary();
       }
 
       function changeMonth(amount) {
-        currentMonth = new Date(
+        const nextMonth = new Date(
           currentMonth.getFullYear(),
           currentMonth.getMonth() + amount,
           1,
         );
-        selectDate(toDateKey(currentMonth));
+        const latestMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+        if (nextMonth.getTime() > latestMonth.getTime()) return;
+        currentMonth = nextMonth;
+        renderCalendar();
       }
 
-      function updateControls() {
-        const locked = recordingState !== "idle";
-        startRecordingButton.disabled = locked;
-        stopRecordingButton.disabled = recordingState !== "recording";
-        diaryEntry.disabled = locked;
-        renderCalendar();
+      function searchDiary() {
+        const keyword = searchKeyword.value.trim();
+        searchResults.replaceChildren();
+
+        if (!keyword) {
+          searchStatus.textContent = "検索するキーワードを入力してください。";
+          return;
+        }
+
+        const needle = keyword.toLocaleLowerCase("ja");
+        const matches = Object.entries(entries)
+          .filter(([, entry]) => entry.text.toLocaleLowerCase("ja").includes(needle))
+          .sort(([dateA], [dateB]) => dateB.localeCompare(dateA));
+
+        for (const [dateKey, entry] of matches) {
+          const item = document.createElement("li");
+          const button = document.createElement("button");
+          const normalizedText = entry.text.toLocaleLowerCase("ja");
+          const matchIndex = normalizedText.indexOf(needle);
+          const start = Math.max(0, matchIndex - 24);
+          const excerpt = entry.text.slice(start, start + 90).replace(/\s+/g, " ");
+          button.type = "button";
+          button.textContent = `${dateFormatter.format(dateFromKey(dateKey))}${entry.title ? ` — ${entry.title}` : ""}`;
+          button.addEventListener("click", () => openDiary(dateKey));
+          const snippet = document.createElement("p");
+          snippet.textContent = `${start > 0 ? "…" : ""}${excerpt}${start + 90 < entry.text.length ? "…" : ""}`;
+          item.append(button, snippet);
+          searchResults.append(item);
+        }
+
+        searchStatus.textContent = matches.length
+          ? `「${keyword}」を含む日記が${matches.length}日分見つかりました。`
+          : `「${keyword}」を含む日記はありません。`;
       }
 
       async function requireWebGPU() {
@@ -237,17 +376,15 @@
           throw new Error("WebGPU が利用できません。WebGPU 対応ブラウザで開いてください。");
         }
         const adapter = await navigator.gpu.requestAdapter();
-        if (!adapter) {
-          throw new Error("WebGPU adapter を取得できませんでした。");
-        }
+        if (!adapter) throw new Error("WebGPU adapter を取得できませんでした。");
       }
 
       function reportModelProgress(info) {
         if (info.status === "progress" && Number.isFinite(info.progress)) {
           const file = info.file ? `: ${info.file}` : "";
-          speechStatus.textContent = `モデルをダウンロード中 ${info.progress.toFixed(0)}%${file}`;
+          speechStatus.textContent = `文字起こしモデルをダウンロード中 ${info.progress.toFixed(0)}%${file}`;
         } else if (info.status === "initiate") {
-          speechStatus.textContent = `モデルを準備中${info.file ? `: ${info.file}` : ""}`;
+          speechStatus.textContent = `文字起こしモデルを準備中${info.file ? `: ${info.file}` : ""}`;
         }
       }
 
@@ -306,7 +443,7 @@
         recordingInterval = null;
         recordingTimeout = null;
         speechStatus.textContent = "録音を文字起こししています。";
-        updateControls();
+        updateDayControls();
         recorder.stop();
       }
 
@@ -343,13 +480,38 @@
       }
 
       function chooseRecorderOptions() {
-        const formats = [
-          "audio/webm;codecs=opus",
-          "audio/mp4",
-          "audio/ogg;codecs=opus",
-        ];
+        const formats = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus"];
         const mimeType = formats.find((format) => MediaRecorder.isTypeSupported(format));
         return mimeType ? { mimeType } : undefined;
+      }
+
+      function buildTitleUrl(dateKey, view) {
+        const url = new URL("title.html", location.href);
+        url.searchParams.set("date", dateKey);
+        url.searchParams.set("view", view);
+        return url.href;
+      }
+
+      async function openTitleGenerator(dateKey, view) {
+        if (!storageAvailable || titleNavigationPending) return;
+        titleNavigationPending = true;
+        titleStatus.textContent = "タイトル作成モデルへ切り替えています。";
+        updateDayControls();
+
+        try {
+          if (transcriber) {
+            const currentTranscriber = transcriber;
+            transcriber = null;
+            transcriberPromise = null;
+            await currentTranscriber.dispose?.();
+          }
+          location.replace(buildTitleUrl(dateKey, view));
+        } catch (error) {
+          console.error(error);
+          titleNavigationPending = false;
+          titleStatus.textContent = `モデルを切り替えられませんでした: ${error instanceof Error ? error.message : String(error)}`;
+          updateDayControls();
+        }
       }
 
       async function transcribeRecording(chunks, mimeType) {
@@ -388,13 +550,21 @@
             return;
           }
 
-          const previousText = typeof entries[recordingDate] === "string"
-            ? entries[recordingDate].trimEnd()
-            : "";
+          const previousText = getEntry(recordingDate).text.trimEnd();
           const nextText = previousText ? `${previousText}\n\n${text}` : text;
+          if (!updateEntry(recordingDate, { text: nextText })) {
+            throw new Error("文字起こし結果を保存できませんでした。");
+          }
+
           diaryEntry.value = nextText;
-          setEntry(recordingDate, nextText);
-          speechStatus.textContent = `${dateFormatter.format(dateFromKey(recordingDate))}の日記に文字起こしを追記しました。`;
+          saveStatus.textContent = "文字起こしを今日の日記に保存しました。";
+          const entry = getEntry(recordingDate);
+          if (!entry.titleEdited) {
+            titleStatus.textContent = "日記からタイトルを作成しています。";
+            await openTitleGenerator(recordingDate, "today");
+          } else {
+            speechStatus.textContent = "文字起こしを今日の日記に追記しました。編集済みのタイトルはそのまま残しています。";
+          }
         } catch (error) {
           console.error(error);
           if (!leavingPage) {
@@ -404,13 +574,17 @@
           if (!leavingPage) {
             recordingState = "idle";
             recordingDate = null;
-            updateControls();
+            updateDayControls();
           }
         }
       }
 
       async function startRecording() {
-        if (recordingState !== "idle") return;
+        if (recordingState !== "idle" || titleNavigationPending) return;
+        if (!storageAvailable) {
+          speechStatus.textContent = "ブラウザの保存領域を利用できないため、録音できません。";
+          return;
+        }
         if (!navigator.mediaDevices?.getUserMedia) {
           speechStatus.textContent = "マイクを利用できません。HTTPSで開いてください。";
           return;
@@ -420,9 +594,9 @@
           return;
         }
 
-        recordingDate = selectedDate;
+        recordingDate = activeDate;
         recordingState = "starting";
-        updateControls();
+        updateDayControls();
         speechStatus.textContent = "マイクへのアクセスを待っています。";
 
         try {
@@ -450,20 +624,47 @@
           recordingInterval = window.setInterval(updateRecordingTime, 250);
           recordingTimeout = window.setTimeout(stopRecording, MAX_RECORDING_SECONDS * 1000);
           speechStatus.textContent = "録音中です。話し終えたら「録音停止」を押してください。";
-          updateControls();
+          updateDayControls();
         } catch (error) {
           console.error(error);
           stopMediaStream();
           recordingState = "idle";
           recordingDate = null;
-          updateControls();
+          updateDayControls();
           speechStatus.textContent = `録音を開始できませんでした: ${error instanceof Error ? error.message : String(error)}`;
         }
       }
 
-      diaryEntry.addEventListener("input", () => setEntry(selectedDate, diaryEntry.value));
+      diaryEntry.addEventListener("input", () => {
+        if (!updateEntry(activeDate, { text: diaryEntry.value })) {
+          saveStatus.textContent = "日記を保存できませんでした。ブラウザの保存領域を確認してください。";
+        } else {
+          saveStatus.textContent = "入力内容をこのブラウザに保存しました。";
+          if (getEntry(activeDate).text.trim() && !getEntry(activeDate).title.trim()) {
+            titleStatus.textContent = "日記の内容からAIでタイトルを作成できます。";
+          }
+          updateDayControls();
+        }
+      });
+
+      diaryTitle.addEventListener("input", () => {
+        if (!updateEntry(activeDate, { title: diaryTitle.value, titleEdited: true })) {
+          titleStatus.textContent = "タイトルを保存できませんでした。";
+          return;
+        }
+        titleStatus.textContent = "タイトルを保存しました。いつでも編集できます。";
+      });
+
+      searchForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        searchDiary();
+      });
       previousMonthButton.addEventListener("click", () => changeMonth(-1));
       nextMonthButton.addEventListener("click", () => changeMonth(1));
+      backButton.addEventListener("click", returnToCalendar);
+      generateTitleButton.addEventListener("click", () => {
+        if (activeDate) void openTitleGenerator(activeDate, activeDate === todayKey ? "today" : "history");
+      });
       startRecordingButton.addEventListener("click", startRecording);
       stopRecordingButton.addEventListener("click", stopRecording);
 
@@ -476,7 +677,18 @@
         transcriber?.dispose?.();
       });
 
-      selectDate(selectedDate);
+      const routeParams = new URLSearchParams(location.search);
+      const routeDate = routeParams.get("date");
+      const routeView = routeParams.get("view");
+      renderCalendar();
+      if (
+        routeDate &&
+        /^\d{4}-\d{2}-\d{2}$/.test(routeDate) &&
+        routeDate <= todayKey &&
+        (routeView === "today" || routeView === "history")
+      ) {
+        openDiary(routeDate, { skipAutomaticTitle: routeParams.get("skipTitle") === "1" });
+      }
     </script>
   </body>
 </html>

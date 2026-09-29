@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>日記のタイトルを作成中</title>
+  </head>
+  <body>
+    <main>
+      <h1>日記のタイトル</h1>
+      <p>日記の内容をブラウザ内のAIで分析しています。</p>
+      <p id="status" role="status" aria-live="polite">準備しています。</p>
+      <p><a id="return-link" hidden>日記に戻る</a></p>
+    </main>
+
+    <script type="module">
+      import { env, pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+      import { loadDiaryEntries, saveDiaryEntries } from "./diary-data.js";
+
+      env.allowLocalModels = false;
+
+      const MODEL_ID = "onnx-community/Qwen2.5-0.5B-Instruct";
+      const status = document.querySelector("#status");
+      const returnLink = document.querySelector("#return-link");
+      const params = new URLSearchParams(location.search);
+      const dateKey = params.get("date") ?? "";
+      const view = params.get("view") === "history" ? "history" : "today";
+      const validDate = /^\d{4}-\d{2}-\d{2}$/.test(dateKey);
+      const returnUrl = new URL("index.html", location.href);
+      if (validDate) {
+        returnUrl.searchParams.set("date", dateKey);
+        returnUrl.searchParams.set("view", view);
+      }
+
+      let generator = null;
+
+      function showReturnLink(skipAutomaticTitle) {
+        if (skipAutomaticTitle) returnUrl.searchParams.set("skipTitle", "1");
+        returnLink.href = returnUrl.href;
+        returnLink.hidden = false;
+      }
+
+      function reportProgress(info) {
+        if (info.status === "progress" && Number.isFinite(info.progress)) {
+          const file = info.file ? `: ${info.file}` : "";
+          status.textContent = `タイトル作成モデルをダウンロード中 ${info.progress.toFixed(0)}%${file}`;
+        } else if (info.status === "initiate") {
+          status.textContent = `タイトル作成モデルを準備中${info.file ? `: ${info.file}` : ""}`;
+        }
+      }
+
+      function requireWebGPU() {
+        if (!navigator.gpu) {
+          throw new Error("WebGPU が利用できません。WebGPU 対応ブラウザで開いてください。");
+        }
+        return navigator.gpu.requestAdapter().then((adapter) => {
+          if (!adapter) throw new Error("WebGPU adapter を取得できませんでした。");
+        });
+      }
+
+      function extractTitle(output) {
+        const generated = output?.[0]?.generated_text;
+        let text = Array.isArray(generated)
+          ? generated.at(-1)?.content ?? ""
+          : typeof generated === "string"
+            ? generated
+            : "";
+        text = text
+          .trim()
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .find(Boolean) ?? "";
+        return text
+          .replace(/^(?:タイトル|題名)\s*[:：]\s*/u, "")
+          .replace(/^["'「『]+|["'」』]+$/gu, "")
+          .trim();
+      }
+
+      async function main() {
+        try {
+          if (!validDate) throw new Error("日記の日付が指定されていません。");
+          const entries = loadDiaryEntries();
+          const entry = entries[dateKey];
+          if (!entry?.text.trim()) throw new Error("タイトルを作る日記が見つかりません。");
+
+          await requireWebGPU();
+          status.textContent = "Qwen2.5 を読み込んでいます。初回はモデルのダウンロードが必要です。";
+          generator = await pipeline("text-generation", MODEL_ID, {
+            device: "webgpu",
+            dtype: "q4f16",
+            progress_callback: reportProgress,
+          });
+
+          status.textContent = "日記からタイトルを作成しています。";
+          const output = await generator(
+            [
+              {
+                role: "system",
+                content: "あなたは日本語の日記編集者です。日記の内容を正確に表す、自然で短いタイトルをひとつ作ってください。本文にない出来事を加えず、説明や引用符を付けず、タイトルだけを返してください。",
+              },
+              {
+                role: "user",
+                content: `次の日記に短いタイトルを付けてください。\n\n${entry.text.slice(0, 3000)}`,
+              },
+            ],
+            {
+              max_new_tokens: 48,
+              do_sample: false,
+            },
+          );
+
+          const title = extractTitle(output);
+          if (!title) throw new Error("タイトルを作成できませんでした。");
+
+          const nextEntries = {
+            ...entries,
+            [dateKey]: { ...entry, title, titleEdited: false },
+          };
+          saveDiaryEntries(nextEntries);
+
+          status.textContent = "タイトルを保存しました。日記に戻ります。";
+          await generator.dispose?.();
+          generator = null;
+          window.setTimeout(() => location.replace(returnUrl.href), 400);
+        } catch (error) {
+          console.error(error);
+          status.textContent = `タイトルを作成できませんでした: ${error instanceof Error ? error.message : String(error)}`;
+          showReturnLink(true);
+        }
+      }
+
+      window.addEventListener("pagehide", () => {
+        generator?.dispose?.();
+      });
+
+      void main();
+    </script>
+  </body>
+</html>
