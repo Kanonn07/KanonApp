@@ -3,349 +3,480 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>画像認識デモ</title>
+    <title>音声日記カレンダー</title>
+    <style>
+      button[aria-pressed="true"] {
+        outline: 2px solid currentColor;
+        font-weight: bold;
+      }
+    </style>
   </head>
   <body>
     <main>
-      <h1>画像認識デモ</h1>
-
-      <p>画像を選ぶと、ブラウザ内のWebGPUで物体を検出します。</p>
-
-      <p>
-        <label for="image-file">画像</label>
-        <input id="image-file" type="file" accept="image/*" />
-      </p>
+      <h1>音声日記カレンダー</h1>
+      <p>日付を選び、経験したことや思ったことを録音してください。音声はブラウザ内で文字起こしし、日記はこのブラウザに保存されます。</p>
 
       <p>
-        <label for="threshold">信頼度のしきい値</label>
-        <input
-          id="threshold"
-          type="number"
-          min="0"
-          max="1"
-          step="0.05"
-          value="0.4"
-        />
+        <button id="previous-month" type="button">前の月</button>
+        <strong id="month-label" aria-live="polite"></strong>
+        <button id="next-month" type="button">次の月</button>
       </p>
 
-      <p>
-        <button id="detect" type="button" disabled>検出</button>
-      </p>
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">日</th>
+            <th scope="col">月</th>
+            <th scope="col">火</th>
+            <th scope="col">水</th>
+            <th scope="col">木</th>
+            <th scope="col">金</th>
+            <th scope="col">土</th>
+          </tr>
+        </thead>
+        <tbody id="calendar-days"></tbody>
+      </table>
 
-      <p id="status" role="status" aria-live="polite">画像を選択してください。</p>
-      <canvas id="preview" aria-label="検出結果"></canvas>
-      <ul id="results" aria-label="検出した物体"></ul>
+      <section aria-labelledby="selected-date">
+        <h2 id="selected-date"></h2>
+        <label for="diary-entry">この日の日記</label>
+        <p><textarea id="diary-entry" rows="8" cols="50"></textarea></p>
+        <p id="save-status" role="status" aria-live="polite"></p>
+      </section>
+
+      <section aria-labelledby="voice-heading">
+        <h2 id="voice-heading">音声入力</h2>
+        <p>録音は最大30秒です。初回は文字起こしモデルのダウンロードにネット接続が必要です。</p>
+        <button id="start-recording" type="button">録音開始</button>
+        <button id="stop-recording" type="button" disabled>録音停止</button>
+        <span id="recording-time" aria-live="polite"></span>
+        <p id="speech-status" role="status" aria-live="polite">録音を開始すると、この日の記録に文字起こしを追記します。</p>
+      </section>
     </main>
 
     <script type="module">
-      import {
-        AutoModel,
-        AutoProcessor,
-        RawImage,
-        env,
-      } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+      import { env, pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
 
       env.allowLocalModels = false;
 
-      const MODEL_ID = "onnx-community/yolov10n";
-      const MAX_IMAGE_SIDE = 960;
-      const fileInput = document.querySelector("#image-file");
-      const thresholdInput = document.querySelector("#threshold");
-      const detectButton = document.querySelector("#detect");
-      const status = document.querySelector("#status");
-      const preview = document.querySelector("#preview");
-      const results = document.querySelector("#results");
-      const previewContext = preview.getContext("2d");
+      const MODEL_ID = "onnx-community/whisper-tiny";
+      const STORAGE_KEY = "kanon-voice-diary-v1";
+      const TARGET_SAMPLE_RATE = 16000;
+      const MAX_RECORDING_SECONDS = 30;
 
-      let sourceCanvas = null;
-      let model = null;
-      let processor = null;
-      let modelPromise = null;
-      let busy = false;
-      let imageLoadToken = 0;
+      const previousMonthButton = document.querySelector("#previous-month");
+      const nextMonthButton = document.querySelector("#next-month");
+      const monthLabel = document.querySelector("#month-label");
+      const calendarDays = document.querySelector("#calendar-days");
+      const selectedDateHeading = document.querySelector("#selected-date");
+      const diaryEntry = document.querySelector("#diary-entry");
+      const saveStatus = document.querySelector("#save-status");
+      const startRecordingButton = document.querySelector("#start-recording");
+      const stopRecordingButton = document.querySelector("#stop-recording");
+      const recordingTime = document.querySelector("#recording-time");
+      const speechStatus = document.querySelector("#speech-status");
 
-      if (!previewContext) {
-        throw new Error("Canvas を利用できません");
+      const monthFormatter = new Intl.DateTimeFormat("ja-JP", {
+        year: "numeric",
+        month: "long",
+      });
+      const dateFormatter = new Intl.DateTimeFormat("ja-JP", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+        weekday: "long",
+      });
+
+      const today = new Date();
+      let currentMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+      let selectedDate = toDateKey(today);
+      let storageAvailable = true;
+      let entries = loadEntries();
+      let transcriber = null;
+      let transcriberPromise = null;
+      let recordingState = "idle";
+      let recorder = null;
+      let mediaStream = null;
+      let recordedChunks = [];
+      let recordingDate = null;
+      let recordingStartedAt = 0;
+      let recordingInterval = null;
+      let recordingTimeout = null;
+      let leavingPage = false;
+
+      function toDateKey(date) {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
       }
 
-      function setStatus(message) {
-        status.textContent = message;
+      function dateFromKey(dateKey) {
+        const [year, month, day] = dateKey.split("-").map(Number);
+        return new Date(year, month - 1, day);
       }
 
-      function progressCallback(info) {
-        if (info.status === "progress" && Number.isFinite(info.progress)) {
-          const file = info.file ? `: ${info.file}` : "";
-          setStatus(`モデルをダウンロード中 ${info.progress.toFixed(0)}%${file}`);
-        } else if (info.status === "initiate") {
-          setStatus(`モデルを準備中${info.file ? `: ${info.file}` : ""}`);
+      function loadEntries() {
+        try {
+          const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
+          if (!saved || Array.isArray(saved) || typeof saved !== "object") {
+            throw new Error("保存データの形式が正しくありません。");
+          }
+          return saved;
+        } catch (error) {
+          console.error(error);
+          storageAvailable = false;
+          saveStatus.textContent = `日記を読み込めませんでした: ${error instanceof Error ? error.message : String(error)}`;
+          return {};
         }
+      }
+
+      function setEntry(dateKey, text) {
+        if (!storageAvailable) {
+          saveStatus.textContent = "ブラウザの保存領域を利用できないため、日記を保存できません。";
+          return;
+        }
+
+        const nextEntries = { ...entries };
+        if (text.trim()) {
+          nextEntries[dateKey] = text;
+        } else {
+          delete nextEntries[dateKey];
+        }
+
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(nextEntries));
+          entries = nextEntries;
+          saveStatus.textContent = text.trim() ? "このブラウザに保存しました。" : "日記を削除しました。";
+          renderCalendar();
+        } catch (error) {
+          console.error(error);
+          storageAvailable = false;
+          saveStatus.textContent = `日記を保存できませんでした: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+
+      function renderCalendar() {
+        monthLabel.textContent = monthFormatter.format(currentMonth);
+        const year = currentMonth.getFullYear();
+        const month = currentMonth.getMonth();
+        const firstWeekday = new Date(year, month, 1).getDay();
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+        const cellCount = Math.ceil((firstWeekday + daysInMonth) / 7) * 7;
+        const rows = [];
+
+        for (let index = 0; index < cellCount; index += 7) {
+          const row = document.createElement("tr");
+
+          for (let column = 0; column < 7; column++) {
+            const day = index + column - firstWeekday + 1;
+            const cell = document.createElement("td");
+
+            if (day < 1 || day > daysInMonth) {
+              cell.setAttribute("aria-hidden", "true");
+            } else {
+              const dateKey = toDateKey(new Date(year, month, day));
+              const button = document.createElement("button");
+              const hasEntry = typeof entries[dateKey] === "string" && entries[dateKey].trim();
+              button.type = "button";
+              button.disabled = recordingState !== "idle";
+              button.setAttribute("aria-pressed", String(dateKey === selectedDate));
+              button.setAttribute(
+                "aria-label",
+                `${dateFormatter.format(dateFromKey(dateKey))}${hasEntry ? "、日記あり" : ""}`,
+              );
+              button.textContent = hasEntry ? `${day} •` : String(day);
+              button.addEventListener("click", () => selectDate(dateKey));
+              cell.append(button);
+            }
+
+            row.append(cell);
+          }
+
+          rows.push(row);
+        }
+
+        calendarDays.replaceChildren(...rows);
+        previousMonthButton.disabled = recordingState !== "idle";
+        nextMonthButton.disabled = recordingState !== "idle";
+      }
+
+      function selectDate(dateKey) {
+        selectedDate = dateKey;
+        const date = dateFromKey(dateKey);
+        currentMonth = new Date(date.getFullYear(), date.getMonth(), 1);
+        selectedDateHeading.textContent = dateFormatter.format(date);
+        diaryEntry.value = typeof entries[dateKey] === "string" ? entries[dateKey] : "";
+        saveStatus.textContent = storageAvailable
+          ? diaryEntry.value.trim()
+            ? "このブラウザに保存されています。"
+            : "日記はまだありません。入力内容は自動保存されます。"
+          : "ブラウザの保存領域を利用できません。";
+        renderCalendar();
+      }
+
+      function changeMonth(amount) {
+        currentMonth = new Date(
+          currentMonth.getFullYear(),
+          currentMonth.getMonth() + amount,
+          1,
+        );
+        selectDate(toDateKey(currentMonth));
+      }
+
+      function updateControls() {
+        const locked = recordingState !== "idle";
+        startRecordingButton.disabled = locked;
+        stopRecordingButton.disabled = recordingState !== "recording";
+        diaryEntry.disabled = locked;
+        renderCalendar();
       }
 
       async function requireWebGPU() {
         if (!navigator.gpu) {
           throw new Error("WebGPU が利用できません。WebGPU 対応ブラウザで開いてください。");
         }
-
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) {
           throw new Error("WebGPU adapter を取得できませんでした。");
         }
-
-        return adapter;
       }
 
-      async function ensureModel() {
-        if (model && processor) {
-          return;
+      function reportModelProgress(info) {
+        if (info.status === "progress" && Number.isFinite(info.progress)) {
+          const file = info.file ? `: ${info.file}` : "";
+          speechStatus.textContent = `モデルをダウンロード中 ${info.progress.toFixed(0)}%${file}`;
+        } else if (info.status === "initiate") {
+          speechStatus.textContent = `モデルを準備中${info.file ? `: ${info.file}` : ""}`;
         }
+      }
 
-        if (!modelPromise) {
-          modelPromise = (async () => {
+      async function ensureTranscriber() {
+        if (transcriber) return transcriber;
+
+        if (!transcriberPromise) {
+          transcriberPromise = (async () => {
             await requireWebGPU();
-            setStatus("YOLOv10n を読み込んでいます。初回はモデルのダウンロードが必要です。");
-
-            const loadedModel = await AutoModel.from_pretrained(MODEL_ID, {
-              device: "webgpu",
-              dtype: "q8",
-              progress_callback: progressCallback,
-            });
-
-            try {
-              const loadedProcessor = await AutoProcessor.from_pretrained(MODEL_ID);
-              model = loadedModel;
-              processor = loadedProcessor;
-            } catch (error) {
-              loadedModel.dispose?.();
-              throw error;
-            }
+            speechStatus.textContent = "Whisper を読み込んでいます。初回はダウンロードが必要です。";
+            transcriber = await pipeline(
+              "automatic-speech-recognition",
+              MODEL_ID,
+              {
+                device: "webgpu",
+                dtype: "q8",
+                progress_callback: reportModelProgress,
+              },
+            );
+            return transcriber;
           })().catch((error) => {
-            modelPromise = null;
+            transcriberPromise = null;
             throw error;
           });
         }
 
-        await modelPromise;
+        return transcriberPromise;
       }
 
-      async function fileToCanvas(file) {
-        if (!file || !file.type.startsWith("image/")) {
-          throw new Error("画像ファイルを選択してください。");
-        }
+      function formatDuration(seconds) {
+        const minutes = String(Math.floor(seconds / 60)).padStart(2, "0");
+        const remainder = String(seconds % 60).padStart(2, "0");
+        return `${minutes}:${remainder}`;
+      }
 
-        const objectUrl = URL.createObjectURL(file);
-        const image = new Image();
-
-        try {
-          image.src = objectUrl;
-          await image.decode();
-        } finally {
-          URL.revokeObjectURL(objectUrl);
-        }
-
-        const scale = Math.min(
-          1,
-          MAX_IMAGE_SIDE / Math.max(image.naturalWidth, image.naturalHeight),
+      function updateRecordingTime() {
+        const elapsed = Math.min(
+          MAX_RECORDING_SECONDS,
+          Math.floor((Date.now() - recordingStartedAt) / 1000),
         );
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-
-        const context = canvas.getContext("2d");
-        if (!context) {
-          throw new Error("画像用 Canvas を作成できませんでした。");
-        }
-        context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        return canvas;
+        recordingTime.textContent = `録音中 ${formatDuration(elapsed)} / ${formatDuration(MAX_RECORDING_SECONDS)}`;
       }
 
-      function disposeTensorTree(value, seen = new Set()) {
-        if (!value || typeof value !== "object" || seen.has(value)) return;
-        seen.add(value);
-
-        if (typeof value.dispose === "function") {
-          value.dispose();
-          return;
-        }
-        if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
-        if (Array.isArray(value)) {
-          for (const item of value) disposeTensorTree(item, seen);
-          return;
-        }
-        for (const item of Object.values(value)) disposeTensorTree(item, seen);
+      function stopMediaStream() {
+        if (!mediaStream) return;
+        for (const track of mediaStream.getTracks()) track.stop();
+        mediaStream = null;
       }
 
-      function drawDetections(detections) {
-        preview.width = sourceCanvas.width;
-        preview.height = sourceCanvas.height;
-        previewContext.drawImage(sourceCanvas, 0, 0);
-        previewContext.lineWidth = Math.max(2, sourceCanvas.width / 400);
-        previewContext.font = `${Math.max(14, sourceCanvas.width / 50)}px sans-serif`;
+      function stopRecording() {
+        if (recordingState !== "recording" || !recorder || recorder.state === "inactive") return;
 
-        for (const detection of detections) {
-          const { x, y, width, height, label, score } = detection;
-          previewContext.strokeStyle = "#e11d48";
-          previewContext.strokeRect(x, y, width, height);
-
-          const text = `${label} ${(score * 100).toFixed(0)}%`;
-          const textHeight = Math.max(18, sourceCanvas.width / 35);
-          const textWidth = previewContext.measureText(text).width;
-          const textY = Math.max(textHeight, y);
-          previewContext.fillStyle = "#e11d48";
-          previewContext.fillRect(x, textY - textHeight, textWidth + 8, textHeight);
-          previewContext.fillStyle = "white";
-          previewContext.fillText(text, x + 4, textY - 4);
-        }
+        recordingState = "processing";
+        clearInterval(recordingInterval);
+        clearTimeout(recordingTimeout);
+        recordingInterval = null;
+        recordingTimeout = null;
+        speechStatus.textContent = "録音を文字起こししています。";
+        updateControls();
+        recorder.stop();
       }
 
-      function showResults(detections) {
-        results.replaceChildren();
+      function toMono16k(audioBuffer) {
+        const sourceRate = audioBuffer.sampleRate;
+        const sourceFrameCount = Math.min(
+          audioBuffer.length,
+          Math.floor(sourceRate * MAX_RECORDING_SECONDS),
+        );
+        const mono = new Float32Array(sourceFrameCount);
 
-        if (detections.length === 0) {
-          const item = document.createElement("li");
-          item.textContent = "しきい値以上の物体は検出されませんでした。";
-          results.append(item);
-          setStatus("検出が完了しました。物体は見つかりませんでした。");
-          return;
+        for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+          const channelData = audioBuffer.getChannelData(channel);
+          for (let frame = 0; frame < sourceFrameCount; frame++) {
+            mono[frame] += channelData[frame] / audioBuffer.numberOfChannels;
+          }
         }
 
-        const counts = new Map();
-        for (const detection of detections) {
-          counts.set(detection.label, (counts.get(detection.label) ?? 0) + 1);
-          const item = document.createElement("li");
-          item.textContent = `${detection.label}: ${(detection.score * 100).toFixed(1)}%`;
-          results.append(item);
+        const outputLength = Math.min(
+          TARGET_SAMPLE_RATE * MAX_RECORDING_SECONDS,
+          Math.floor(sourceFrameCount * TARGET_SAMPLE_RATE / sourceRate),
+        );
+        const resampled = new Float32Array(outputLength);
+
+        for (let frame = 0; frame < outputLength; frame++) {
+          const position = frame * sourceRate / TARGET_SAMPLE_RATE;
+          const left = Math.floor(position);
+          const right = Math.min(left + 1, sourceFrameCount - 1);
+          const fraction = position - left;
+          resampled[frame] = mono[left] * (1 - fraction) + mono[right] * fraction;
         }
 
-        const summary = [...counts.entries()]
-          .map(([label, count]) => `${label} ${count}個`)
-          .join("、");
-        setStatus(`${detections.length}件を検出しました: ${summary}`);
+        return resampled;
       }
 
-      function parseDetections(output, activeProcessor, activeModel, threshold) {
-        if (!output || output.dims.at(-1) !== 6) {
-          const shape = output?.dims?.join(", ") ?? "不明";
-          throw new Error(`YOLO の出力 shape が想定外です: [${shape}]`);
-        }
-
-        const [newHeight, newWidth] = activeProcessor.reshaped_input_sizes[0];
-        const scaleX = sourceCanvas.width / newWidth;
-        const scaleY = sourceCanvas.height / newHeight;
-        const detections = [];
-        const data = output.data;
-
-        for (let offset = 0; offset < data.length; offset += 6) {
-          const [xmin, ymin, xmax, ymax, score, classValue] = data.subarray(
-            offset,
-            offset + 6,
-          );
-          if (!Number.isFinite(score) || score < threshold) continue;
-
-          const classId = Math.trunc(classValue);
-          const rawLabel = activeModel.config.id2label?.[classId];
-          const label = rawLabel ?? String(classId);
-          const left = Math.max(0, Math.min(sourceCanvas.width, xmin * scaleX));
-          const top = Math.max(0, Math.min(sourceCanvas.height, ymin * scaleY));
-          const right = Math.max(0, Math.min(sourceCanvas.width, xmax * scaleX));
-          const bottom = Math.max(0, Math.min(sourceCanvas.height, ymax * scaleY));
-
-          if (right <= left || bottom <= top) continue;
-          detections.push({
-            x: left,
-            y: top,
-            width: right - left,
-            height: bottom - top,
-            label,
-            score,
-          });
-        }
-
-        return detections;
+      function chooseRecorderOptions() {
+        const formats = [
+          "audio/webm;codecs=opus",
+          "audio/mp4",
+          "audio/ogg;codecs=opus",
+        ];
+        const mimeType = formats.find((format) => MediaRecorder.isTypeSupported(format));
+        return mimeType ? { mimeType } : undefined;
       }
 
-      async function detect() {
-        if (busy) return;
-        if (!sourceCanvas) {
-          setStatus("先に画像を選択してください。");
-          return;
-        }
-
-        const threshold = Number(thresholdInput.value);
-        if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
-          setStatus("信頼度のしきい値は 0 から 1 の範囲で入力してください。");
-          return;
-        }
-
-        busy = true;
-        detectButton.disabled = true;
-        fileInput.disabled = true;
-        thresholdInput.disabled = true;
-        results.replaceChildren();
-
-        let processed = null;
-        let output = null;
+      async function transcribeRecording(chunks, mimeType) {
         try {
-          await ensureModel();
-          setStatus("画像を処理しています。");
-          const rawImage = RawImage.fromCanvas(sourceCanvas);
-          processed = await processor(rawImage);
-          output = await model({ images: processed.pixel_values });
+          if (leavingPage) return;
+          const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
+          if (blob.size === 0) throw new Error("録音データを取得できませんでした。");
 
-          const detections = parseDetections(
-            output.output0,
-            processed,
-            model,
-            threshold,
-          );
-          drawDetections(detections);
-          showResults(detections);
+          const AudioContextClass = window.AudioContext ?? window.webkitAudioContext;
+          if (!AudioContextClass) throw new Error("このブラウザでは音声を読み込めません。");
+
+          const audioContext = new AudioContextClass();
+          let audio;
+          try {
+            const decoded = await audioContext.decodeAudioData(await blob.arrayBuffer());
+            audio = toMono16k(decoded);
+          } finally {
+            await audioContext.close();
+          }
+
+          if (audio.length === 0) throw new Error("録音された音声が短すぎます。");
+          if (leavingPage) return;
+
+          const activeTranscriber = await ensureTranscriber();
+          if (leavingPage) return;
+          speechStatus.textContent = "音声を解析しています。";
+          const result = await activeTranscriber(audio, { task: "transcribe" });
+          const text = Array.isArray(result)
+            ? result.map((part) => part.text ?? "").join(" ").trim()
+            : typeof result?.text === "string"
+              ? result.text.trim()
+              : "";
+
+          if (!text) {
+            speechStatus.textContent = "音声を文字起こしできませんでした。もう一度録音してください。";
+            return;
+          }
+
+          const previousText = typeof entries[recordingDate] === "string"
+            ? entries[recordingDate].trimEnd()
+            : "";
+          const nextText = previousText ? `${previousText}\n\n${text}` : text;
+          diaryEntry.value = nextText;
+          setEntry(recordingDate, nextText);
+          speechStatus.textContent = `${dateFormatter.format(dateFromKey(recordingDate))}の日記に文字起こしを追記しました。`;
         } catch (error) {
           console.error(error);
-          setStatus(`エラー: ${error instanceof Error ? error.message : String(error)}`);
+          if (!leavingPage) {
+            speechStatus.textContent = `エラー: ${error instanceof Error ? error.message : String(error)}`;
+          }
         } finally {
-          disposeTensorTree(output);
-          disposeTensorTree(processed);
-          busy = false;
-          detectButton.disabled = !sourceCanvas;
-          fileInput.disabled = false;
-          thresholdInput.disabled = false;
+          if (!leavingPage) {
+            recordingState = "idle";
+            recordingDate = null;
+            updateControls();
+          }
         }
       }
 
-      fileInput.addEventListener("change", async () => {
-        const file = fileInput.files?.[0];
-        if (!file) return;
+      async function startRecording() {
+        if (recordingState !== "idle") return;
+        if (!navigator.mediaDevices?.getUserMedia) {
+          speechStatus.textContent = "マイクを利用できません。HTTPSで開いてください。";
+          return;
+        }
+        if (typeof MediaRecorder === "undefined") {
+          speechStatus.textContent = "このブラウザは音声録音に対応していません。";
+          return;
+        }
 
-        const token = ++imageLoadToken;
-        detectButton.disabled = true;
-        results.replaceChildren();
-        setStatus("画像を読み込んでいます。");
+        recordingDate = selectedDate;
+        recordingState = "starting";
+        updateControls();
+        speechStatus.textContent = "マイクへのアクセスを待っています。";
 
         try {
-          const nextCanvas = await fileToCanvas(file);
-          if (token !== imageLoadToken) return;
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          if (leavingPage) {
+            stopMediaStream();
+            return;
+          }
 
-          sourceCanvas = nextCanvas;
-          preview.width = sourceCanvas.width;
-          preview.height = sourceCanvas.height;
-          previewContext.drawImage(sourceCanvas, 0, 0);
-          detectButton.disabled = false;
-          setStatus(`画像を読み込みました (${sourceCanvas.width} × ${sourceCanvas.height})。`);
+          recorder = new MediaRecorder(mediaStream, chooseRecorderOptions());
+          recordedChunks = [];
+          recorder.addEventListener("dataavailable", (event) => {
+            if (event.data.size > 0) recordedChunks.push(event.data);
+          });
+          recorder.addEventListener("stop", () => {
+            const chunks = recordedChunks;
+            const mimeType = recorder?.mimeType;
+            stopMediaStream();
+            void transcribeRecording(chunks, mimeType);
+          }, { once: true });
+          recorder.start();
+          recordingStartedAt = Date.now();
+          recordingState = "recording";
+          updateRecordingTime();
+          recordingInterval = window.setInterval(updateRecordingTime, 250);
+          recordingTimeout = window.setTimeout(stopRecording, MAX_RECORDING_SECONDS * 1000);
+          speechStatus.textContent = "録音中です。話し終えたら「録音停止」を押してください。";
+          updateControls();
         } catch (error) {
-          if (token !== imageLoadToken) return;
           console.error(error);
-          sourceCanvas = null;
-          preview.width = 0;
-          preview.height = 0;
-          setStatus(`エラー: ${error instanceof Error ? error.message : String(error)}`);
+          stopMediaStream();
+          recordingState = "idle";
+          recordingDate = null;
+          updateControls();
+          speechStatus.textContent = `録音を開始できませんでした: ${error instanceof Error ? error.message : String(error)}`;
         }
-      });
+      }
 
-      detectButton.addEventListener("click", detect);
+      diaryEntry.addEventListener("input", () => setEntry(selectedDate, diaryEntry.value));
+      previousMonthButton.addEventListener("click", () => changeMonth(-1));
+      nextMonthButton.addEventListener("click", () => changeMonth(1));
+      startRecordingButton.addEventListener("click", startRecording);
+      stopRecordingButton.addEventListener("click", stopRecording);
 
       window.addEventListener("pagehide", () => {
-        model?.dispose?.();
+        leavingPage = true;
+        clearInterval(recordingInterval);
+        clearTimeout(recordingTimeout);
+        if (recorder && recorder.state !== "inactive") recorder.stop();
+        stopMediaStream();
+        transcriber?.dispose?.();
       });
+
+      selectDate(selectedDate);
     </script>
   </body>
 </html>
